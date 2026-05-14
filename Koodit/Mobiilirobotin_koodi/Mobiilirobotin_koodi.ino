@@ -19,14 +19,14 @@ static const char* AP_PASSWORD = "OmaSalasana"; // 8–63 merkkiä
  *    - L298N mini
  *      > IN1 → D1 (GPIO5)   Vasen moottori +
  *      > IN2 → D2 (GPIO4)   Vasen moottori -
- *      > IN3 → D7 (GPIO13)  Oikea moottori +
- *      > IN4 → D8 (GPIO15)  Oikea moottori -
+ *      > IN3 → D6 (GPIO12)  Oikea moottori +
+ *      > IN4 → D5 (GPIO14)  Oikea moottori -
  *
  *    - ULTRAÄÄNIANTURIT (HC-SR04):
- *      > Etu Trig → D6 (GPIO12)
- *      > Etu Echo → D5 (GPIO14)
+ *      > Etu Trig → D7 (GPIO13)
+ *      > Etu Echo → D8 (GPIO15)
  *      > Taka Trig → D0 (GPIO16)
- *      > Taka Echo → RX (GPIO3)
+ *      > Taka Echo → D3 (GPIO0)
  */
 
 #include <ESP8266WiFi.h>
@@ -49,24 +49,26 @@ DNSServer dnsServer;
 // ───── Moottorien ohjauspinnit ─────
 const int IN1 = 5;   // D1 – vasen +
 const int IN2 = 4;   // D2 – vasen -
-const int IN3 = 13;  // D7 – oikea +
-const int IN4 = 15;  // D8 – oikea -
+const int IN3 = 12;  // D6 – oikea +
+const int IN4 = 14;  // D5 – oikea -
 
 // ───── Ultraäänianturit ─────
-const int FRONT_TRIG = 12; // D6
-const int FRONT_ECHO = 14; // D5
+const int FRONT_TRIG = 13; // D7
+const int FRONT_ECHO = 15; // D8
 const int BACK_TRIG  = 16; // D0
-const int BACK_ECHO  =  3; // RX
+const int BACK_ECHO  =  0; // D3
 
 static constexpr float SOUND_CM_PER_US = 0.0343f;
 static constexpr uint32_t ECHO_TIMEOUT_US = 25000UL;
 static constexpr float NO_ECHO_CM = 999.0f;
-// Voit muokata tästä robotin pysähtymisetäisyyttä, mutta omalla vastuulla
-static constexpr float STOP_CM = 10.0f;
+
+// Törmäyksenestoetäisyys skaalautuu nopeuden mukaan lineaarisesti
+static constexpr float STOP_MIN_CM = 20.0f;  // Etäisyys minimi nopeudella (10 %)
+static constexpr float STOP_MAX_CM = 50.0f;  // Etäisyys maksimi nopeudella (100 %)
 
 // ───── Etäisyydet ─────
-volatile float frontCm = NO_ECHO_CM;
-volatile float backCm  = NO_ECHO_CM;
+float frontCm = NO_ECHO_CM;
+float backCm  = NO_ECHO_CM;
 
 // ───── Kalibrointi ─────
 float leftCalib  = 1.0f;
@@ -93,7 +95,7 @@ static constexpr uint32_t SENSOR_INTERVAL_MS = 100UL;
 unsigned long lastSensorMs = 0;
 bool measureFront = true;
 
-// ───── AP:n uudelleenkäynnistys nimen vaihdon jälkeen ─────
+// ───── Tukiaseman uudelleenkäynnistys nimen vaihdon jälkeen ─────
 bool apRestartPending = false;
 unsigned long apRestartAt = 0;
 static constexpr uint32_t AP_RESTART_DELAY_MS = 400UL;
@@ -235,12 +237,11 @@ float readDistance(int trigPin, int echoPin) {
 void applyMotion() {
   Direction dir = activeDirection();
 
-  if (dir == DIR_FORWARD && frontCm < STOP_CM) {
-    dir = DIR_NONE;
-  }
-  if (dir == DIR_BACKWARD && backCm < STOP_CM) {
-    dir = DIR_NONE;
-  }
+  // Törmäyksenestoetäisyys lasketaan lineaarisesti nopeuden mukaan
+  float stopCm = STOP_MIN_CM + (STOP_MAX_CM - STOP_MIN_CM) * (speedPercent - 10) / 90.0f;
+
+  if (dir == DIR_FORWARD  && frontCm < stopCm) dir = DIR_NONE;
+  if (dir == DIR_BACKWARD && backCm  < stopCm) dir = DIR_NONE;
 
   switch (dir) {
     case DIR_FORWARD:  motorForward(speedPWM);  break;
@@ -261,7 +262,9 @@ void handleButton(Direction direction, bool isPressed) {
 // ═══════════════════════════════════════════════════════
 
 static inline int percentToPWM(int pct) {
-  return map(constrain(pct, 10, 100), 10, 100, 30, 255);
+  // 10 % → PWM 130
+  // 100 % → PWM 255
+  return map(constrain(pct, 10, 100), 10, 100, 130, 255);
 }
 
 // ═══════════════════════════════════════════════════════
@@ -537,7 +540,7 @@ window.addEventListener('load', () => {
   bindHold('btnL', 'l1', 'l0');
   bindHold('btnR', 'r1', 'r0');
   updateUI();
-  setInterval(updateUI, 800);
+  setInterval(updateUI, 1000);
 });
 
 window.addEventListener('pagehide', () => { sendCmd('stopall'); });
@@ -567,7 +570,6 @@ void setupRoutes() {
     req->send(res);
   });
 
-  // Captive portal -tyypillisiä tarkistuksia
   server.on("/generate_204", HTTP_GET, [](AsyncWebServerRequest* r) { r->redirect("/"); });
   server.on("/hotspot-detect.html", HTTP_GET, [](AsyncWebServerRequest* r) { r->redirect("/"); });
   server.on("/ncsi.txt", HTTP_GET, [](AsyncWebServerRequest* r) { r->send(200, "text/plain", "Microsoft NCSI"); });
@@ -605,28 +607,28 @@ void setupRoutes() {
   });
 
   server.on("/clu", HTTP_GET, [](AsyncWebServerRequest* r) {
-    leftCalib = constrain(leftCalib + 0.05f, 0.5f, 1.0f);
+    leftCalib = constrain(leftCalib + 0.01f, 0.5f, 1.0f);
     applyMotion();
     saveConfig();
     r->send(200, "text/plain", "OK");
   });
 
   server.on("/cld", HTTP_GET, [](AsyncWebServerRequest* r) {
-    leftCalib = constrain(leftCalib - 0.05f, 0.5f, 1.0f);
+    leftCalib = constrain(leftCalib - 0.01f, 0.5f, 1.0f);
     applyMotion();
     saveConfig();
     r->send(200, "text/plain", "OK");
   });
 
   server.on("/cru", HTTP_GET, [](AsyncWebServerRequest* r) {
-    rightCalib = constrain(rightCalib + 0.05f, 0.5f, 1.0f);
+    rightCalib = constrain(rightCalib + 0.01f, 0.5f, 1.0f);
     applyMotion();
     saveConfig();
     r->send(200, "text/plain", "OK");
   });
 
   server.on("/crd", HTTP_GET, [](AsyncWebServerRequest* r) {
-    rightCalib = constrain(rightCalib - 0.05f, 0.5f, 1.0f);
+    rightCalib = constrain(rightCalib - 0.01f, 0.5f, 1.0f);
     applyMotion();
     saveConfig();
     r->send(200, "text/plain", "OK");
@@ -672,17 +674,16 @@ void setupRoutes() {
 }
 
 // ═══════════════════════════════════════════════════════
-//  SETUP - Tämä ajetaan vain kerran käynnistyessä
+//  SETUP - Tämä suoritetaan vain kerran käynnistyessä
 // ═══════════════════════════════════════════════════════
 
 void setup() {
-  pinMode(0, OUTPUT);
-  digitalWrite(0, HIGH);
+  pinMode(IN1, OUTPUT); digitalWrite(IN1, LOW);
+  pinMode(IN2, OUTPUT); digitalWrite(IN2, LOW);
+  pinMode(IN3, OUTPUT); digitalWrite(IN3, LOW);
+  pinMode(IN4, OUTPUT); digitalWrite(IN4, LOW);
 
-  pinMode(IN1, OUTPUT);
-  pinMode(IN2, OUTPUT);
-  pinMode(IN3, OUTPUT);
-  pinMode(IN4, OUTPUT);
+  motorStop();
 
   pinMode(FRONT_TRIG, OUTPUT);
   pinMode(FRONT_ECHO, INPUT);
@@ -691,8 +692,6 @@ void setup() {
 
   analogWriteRange(255);
   analogWriteFreq(1000);
-
-  motorStop();
 
   if (!LittleFS.begin()) {
     LittleFS.format();
@@ -708,7 +707,7 @@ void setup() {
 }
 
 // ═══════════════════════════════════════════════════════
-//  LOOP - Tätä loopataan jatkuvasti
+//  LOOP - Tätä suoritetaan jatkuvasti
 // ═══════════════════════════════════════════════════════
 
 void loop() {
